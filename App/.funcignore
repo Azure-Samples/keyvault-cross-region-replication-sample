@@ -1,0 +1,5 @@
+local.settings.json
+.vscode/
+bin/
+obj/
+extensions.csproj

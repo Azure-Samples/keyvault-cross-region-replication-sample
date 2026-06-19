@@ -1,0 +1,116 @@
+name: CI — Deploy, Test, and Teardown
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  id-token: write   # Required for OIDC federated identity
+  contents: read
+
+env:
+  LOCATION:        westeurope
+  TARGET_LOCATION: swedencentral
+
+jobs:
+  # ── 1. Deploy test environment ──────────────────────────────────────────────
+  deploy:
+    name: Deploy test environment
+    runs-on: ubuntu-latest
+    outputs:
+      resource-group: ${{ steps.deploy.outputs.resource-group }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Azure Functions Core Tools
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Deploy test environment
+        id: deploy
+        shell: pwsh
+        run: |
+          $rg = "rg-kvrep-ci-${{ github.run_id }}"
+          .\Tests\Deploy-TestEnvironment.ps1 `
+            -ResourceGroupName $rg `
+            -Location          $env:LOCATION `
+            -TargetLocation    $env:TARGET_LOCATION `
+            -Force
+          echo "resource-group=$rg" >> $env:GITHUB_OUTPUT
+
+      - name: Upload tests.env.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-env
+          path: Tests/tests.env.json
+          retention-days: 1
+
+  # ── 2. Run Pester tests ─────────────────────────────────────────────────────
+  test:
+    name: Run Pester tests
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download tests.env.json
+        uses: actions/download-artifact@v4
+        with:
+          name: test-env
+          path: Tests/
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester Tests\Test-Replication.Tests.ps1 -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) {
+            Write-Error "$($result.FailedCount) test(s) failed."
+            exit 1
+          }
+
+  # ── 3. Teardown — always runs ───────────────────────────────────────────────
+  teardown:
+    name: Teardown test environment
+    runs-on: ubuntu-latest
+    needs: [ deploy, test ]
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete test resource group
+        shell: pwsh
+        run: |
+          $rg = "${{ needs.deploy.outputs.resource-group }}"
+          if ($rg) {
+            Write-Host "Deleting resource group: $rg"
+            az group delete --name $rg --yes --no-wait
+          }
